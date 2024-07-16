@@ -257,6 +257,7 @@ def make_train(config):
                 rng, _rng = jax.random.split(rng)
                 permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
                 batch = (init_hstate, traj_batch, advantages, targets)
+                
 
                 shuffled_batch = jax.tree_util.tree_map(
                     lambda x: jnp.take(x, permutation, axis=1), batch

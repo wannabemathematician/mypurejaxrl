@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union, Any
 from gymnax.environments import environment, spaces
 from brax import envs
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
-import navix as nx
+#import navix as nx
 
 
 class GymnaxWrapper(object):
@@ -145,7 +145,7 @@ class BraxGymnaxWrapper:
             shape=(self._env.action_size,),
         )
 
-class NavixGymnaxWrapper:
+'''class NavixGymnaxWrapper:
     def __init__(self, env_name):
         self._env = nx.make(env_name)
 
@@ -168,7 +168,7 @@ class NavixGymnaxWrapper:
     def action_space(self, params):
         return spaces.Discrete(
             num_categories=self._env.action_space.maximum.item() + 1,
-        )
+        )'''
 
 
 class ClipAction(GymnaxWrapper):

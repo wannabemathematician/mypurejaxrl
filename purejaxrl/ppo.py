@@ -290,7 +290,7 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ENV_NAME": "CartPole-v1",
         "ANNEAL_LR": True,
-        "DEBUG": True,
+        "DEBUG": False,
     }
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
