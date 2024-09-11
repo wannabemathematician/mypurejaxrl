@@ -11,8 +11,14 @@ import distrax
 import gymnax
 import functools
 from gymnax.environments import spaces
-from wrappers import FlattenObservationWrapper, LogWrapper
-
+from wrappers import (
+    LogWrapper,
+    BraxGymnaxWrapper,
+    VecEnv,
+    NormalizeVecObservation,
+    NormalizeVecReward,
+    ClipAction,
+)
 
 class ScannedRNN(nn.Module):
     @functools.partial(
@@ -27,7 +33,7 @@ class ScannedRNN(nn.Module):
         """Applies the module."""
         def c(x):
             print('call')
-        jax.debug.callback(c, 0)
+        #jax.debug.callback(c, 0)
         rnn_state = carry
         ins, resets = x
         rnn_state = jnp.where(
@@ -70,7 +76,8 @@ class ActorCriticRNN(nn.Module):
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
 
-        pi = distrax.Categorical(logits=actor_mean)
+        actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
         critic = nn.Dense(128, kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
@@ -81,7 +88,7 @@ class ActorCriticRNN(nn.Module):
         )
         def c(input, hidden, embedding, out):
             print('funky stuff', input.shape, hidden.shape, embedding.shape, out.shape)
-        jax.debug.callback(c, obs, hidden, embedding, critic)
+        #jax.debug.callback(c, obs, hidden, embedding, critic)
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
 
@@ -102,9 +109,13 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-    env, env_params = gymnax.make(config["ENV_NAME"])
-    env = FlattenObservationWrapper(env)
+    env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
     env = LogWrapper(env)
+    env = ClipAction(env)
+    env = VecEnv(env)
+    if config["NORMALIZE_ENV"]:
+        env = NormalizeVecObservation(env)
+        env = NormalizeVecReward(env, config["GAMMA"])
 
     def linear_schedule(count):
         frac = (
@@ -116,11 +127,11 @@ def make_train(config):
 
     def train(rng):
         # INIT NETWORK
-        network = ActorCriticRNN(env.action_space(env_params).n, config=config)
+        network = ActorCriticRNN(env.action_space(env_params).shape[0], config=config)
         rng, _rng = jax.random.split(rng)
         init_x = (
             jnp.zeros(
-                (1, config["NUM_ENVS"], *env.observation_space(env_params).shape)
+                (1, config["NUM_ENVS"], env.observation_space(env_params).shape[0])
             ),
             jnp.zeros((1, config["NUM_ENVS"])),
         )
@@ -146,16 +157,15 @@ def make_train(config):
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv, env_state = env.reset(reset_rng, env_params)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], 128)
-        print('init h_state', init_hstate.shape, config['NUM_ENVS'])
        
 
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, i_update):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng, loss_store = runner_state
                 rng, _rng = jax.random.split(rng)
 
                 # SELECT ACTION
@@ -172,22 +182,22 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
+                obsv, env_state, reward, done, info = env.step(
+                    rng_step, env_state, action, env_params
+                )
                 transition = Transition(
                     last_done, action, value, reward, log_prob, last_obs, info
                 )
-                runner_state = (train_state, env_state, obsv, done, hstate, rng)
+                runner_state = (train_state, env_state, obsv, done, hstate, rng, loss_store)
                 return runner_state, transition
 
-            initial_hstate = runner_state[-2]
+            initial_hstate = runner_state[-3]
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, loss_store = runner_state
             ac_in = (last_obs[np.newaxis, :], last_done[np.newaxis, :])
             _, _, last_val = network.apply(train_state.params, hstate, ac_in)
             last_val = last_val.squeeze(0)
@@ -203,13 +213,13 @@ def make_train(config):
             advantages, targets = _calculate_gae(traj_batch, last_val, last_done)
 
             # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
+            def _update_epoch(update_state, i_epoch):
                 def _update_minbatch(train_state, batch_info):
                     init_hstate, traj_batch, advantages, targets = batch_info
 
                     def minibatch_details(init_hstate, traj_batch, advantages, targets):
                         print(f'mini details {init_hstate.shape} {traj_batch.obs.shape} {advantages.shape} {targets.shape}')
-                    jax.debug.callback(minibatch_details, init_hstate, traj_batch, advantages, targets)
+                    #jax.debug.callback(minibatch_details, init_hstate, traj_batch, advantages, targets)
                     def _loss_fn(params, init_hstate, traj_batch, gae, targets):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
@@ -219,7 +229,7 @@ def make_train(config):
 
                         def c(x):
                             print('size',x.shape)
-                        jax.debug.callback(c, traj_batch.obs)
+                        #jax.debug.callback(c, traj_batch.obs)
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -229,7 +239,7 @@ def make_train(config):
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         def print_loss(loss_actor):
                             print('loss actor', loss_actor.shape)
-                        jax.debug.callback(print_loss, value_losses_clipped)
+                        #jax.debug.callback(print_loss, value_losses_clipped)
                         value_loss = (
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
@@ -272,6 +282,7 @@ def make_train(config):
                     advantages,
                     targets,
                     rng,
+                    loss_store
                 ) = update_state
 
                 rng, _rng = jax.random.split(rng)
@@ -280,7 +291,7 @@ def make_train(config):
 
                 def batch_details(init_hstate, traj_batch, advantages, targets):
                     print(f'batch details {init_hstate.shape} {traj_batch.obs.shape} {advantages.shape} {targets.shape}')
-                jax.debug.callback(batch_details, init_hstate, traj_batch, advantages, targets)
+                #jax.debug.callback(batch_details, init_hstate, traj_batch, advantages, targets)
                 shuffled_batch = jax.tree_util.tree_map(
                     lambda x: jnp.take(x, permutation, axis=1), batch
                 )
@@ -301,6 +312,14 @@ def make_train(config):
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
                 )
+                actor_loss = total_loss[1][0]
+                value_loss = total_loss[1][1]
+
+                actor_store, value_store = loss_store
+                actor_store = actor_store.at[i_update * int(config["UPDATE_EPOCHS"]) + i_epoch].set(jnp.mean(actor_loss))
+                value_store = value_store.at[i_update * int(config["UPDATE_EPOCHS"]) + i_epoch].set(jnp.mean(value_loss))
+                loss_store = (actor_store, value_store)
+
                 update_state = (
                     train_state,
                     init_hstate,
@@ -308,6 +327,7 @@ def make_train(config):
                     advantages,
                     targets,
                     rng,
+                    loss_store
                 )
                 return update_state, total_loss
 
@@ -319,13 +339,16 @@ def make_train(config):
                 advantages,
                 targets,
                 rng,
+                loss_store
             )
             update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+                _update_epoch, update_state, jnp.arange(config['UPDATE_EPOCHS']), config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
             metric = traj_batch.info
-            rng = update_state[-1]
+            rng = update_state[-2]
+            loss_store = update_state[-1]
+
             if config.get("DEBUG"):
 
                 def callback(info):
@@ -342,8 +365,12 @@ def make_train(config):
 
                 jax.debug.callback(callback, metric)
 
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, loss_store)
             return runner_state, metric
+
+        actor_losses = jnp.zeros((int(config['NUM_UPDATES'] * config['UPDATE_EPOCHS'])))
+        value_losses = jnp.zeros((int(config['NUM_UPDATES'] * config['UPDATE_EPOCHS'])))
+        loss_store = (actor_losses, value_losses)
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -353,18 +380,21 @@ def make_train(config):
             jnp.zeros((config["NUM_ENVS"]), dtype=bool),
             init_hstate,
             _rng,
+            loss_store
         )
+
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, jnp.arange(int(config['NUM_UPDATES'])), config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state, "metric": metric}
+        train_state, env_state, last_obs, last_done, hstate, rng, loss_store = runner_state
+        return {"runner_state": runner_state, "metric": metric, 'losses': loss_store}
 
     return train
 
 
 if __name__ == "__main__":
     config = {
-        "LR": 2.5e-4,
+        "LR": 6e-4,
         "NUM_ENVS": 16,
         "NUM_STEPS": 64,#128,
         "TOTAL_TIMESTEPS": 5e5,
@@ -376,11 +406,24 @@ if __name__ == "__main__":
         "ENT_COEF": 0.01,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
-        "ENV_NAME": "CartPole-v1",
+        "ENV_NAME": "hopper",
         "ANNEAL_LR": True,
-        "DEBUG": True,
+        "NORMALIZE_ENV": True,
+        "DEBUG": False,
     }
+
 
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
+    
+    agent_mean = np.mean(np.mean(out['metric']['returned_episode_returns'], axis=1),axis=1)
+    agent_var = np.var(np.var(out['metric']['returned_episode_returns'], axis=1),axis=1)
+    (agent_losses, value_losses) = out['losses']
+
+    print(f'LR={jnp.log(lr)} Mean and var reward mean', agent_mean[-1], agent_var[-1])
+    folder = 'data/'
+    np.savetxt(folder + config['ENV_NAME'] +'_ppornn_mean.csv', agent_mean, delimiter=',')
+    np.savetxt(folder + config['ENV_NAME'] +'_ppornn_var.csv', agent_var, delimiter=',')
+    np.savetxt(folder + config['ENV_NAME'] + '_pporrn_actor_loss', agent_losses, delimiter=',')
+    np.savetxt(folder + config['ENV_NAME'] + '_pporrn_value_loss', agent_losses, delimiter=',')

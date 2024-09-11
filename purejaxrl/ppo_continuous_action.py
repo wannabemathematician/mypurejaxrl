@@ -1,4 +1,5 @@
 import jax
+import time
 import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
@@ -185,6 +186,9 @@ def make_train(config):
                         # RERUN NETWORK
                         pi, value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
+                        def c(x):
+                            print('obs shape', x.shape)
+                        jax.debug.callback(c, traj_batch.obs)
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -253,6 +257,7 @@ def make_train(config):
                 return update_state, total_loss
 
             update_state = (train_state, traj_batch, advantages, targets, rng)
+            start = time.time()
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
@@ -291,9 +296,9 @@ def make_train(config):
 if __name__ == "__main__":
     config = {
         "LR": 3e-4,
-        "NUM_ENVS": 2048,
+        "NUM_ENVS": 128,
         "NUM_STEPS": 10,
-        "TOTAL_TIMESTEPS": 5e7,
+        "TOTAL_TIMESTEPS": 1e6,
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 32,
         "GAMMA": 0.99,
@@ -306,8 +311,16 @@ if __name__ == "__main__":
         "ENV_NAME": "hopper",
         "ANNEAL_LR": False,
         "NORMALIZE_ENV": True,
-        "DEBUG": True,
+        "DEBUG": False,
     }
-    rng = jax.random.PRNGKey(30)
+    rng = jax.random.PRNGKey(3245432)
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
+    agent_mean = np.mean(np.mean(out['metrics']['returned_episode_returns'], axis=1),axis=1)
+    agent_var = np.var(np.var(out['metrics']['returned_episode_returns'], axis=1),axis=1)
+
+
+    print('Mean and var reward mean', agent_mean[-1], agent_var[-1])
+    np.savetxt('data1/'+ config['ENV_NAME'] +'_ppo_mean.csv', agent_mean, delimiter=',')
+    np.savetxt('data1/'+ config['ENV_NAME'] +'_ppo_var.csv', agent_var, delimiter=',')
+       
